@@ -5,19 +5,20 @@ from .account import Account
 from .attachments import FileAttachment, ItemAttachment
 from .autodiscover import discover
 from .configuration import Configuration
-from .credentials import DELEGATE, IMPERSONATION, Credentials, ServiceAccount
+from .credentials import DELEGATE, IMPERSONATION, Credentials, OAuthCredentials, ServiceAccount
 from .ewsdatetime import EWSDate, EWSDateTime, EWSTimeZone, UTC, UTC_NOW
 from .extended_properties import ExtendedProperty, ExternId, Flag
 from .folders import Folder, FolderCollection, SHALLOW, DEEP
 from .items import AcceptItem, TentativelyAcceptItem, DeclineItem, CalendarItem, CancelCalendarItem, Contact, \
     DistributionList, Message, PostItem, Task
 from .properties import Body, HTMLBody, ItemId, Mailbox, Attendee, Room, RoomList, UID
+from .protocol import BaseProtocol
 from .restriction import Q
 from .transport import BASIC, DIGEST, NTLM, GSSAPI
 from .version import Build, Version
 from .settings import OofSettings
 
-__version__ = '1.11.4'
+__version__ = '1.11.5'
 
 __all__ = [
     '__version__',
@@ -37,6 +38,9 @@ __all__ = [
     'BASIC', 'DIGEST', 'NTLM', 'GSSAPI',
     'Build', 'Version',
 ]
+
+# Set a default user agent, e.g. "exchangelib/3.1.1"
+BaseProtocol.USERAGENT = "%s/%s" % (__name__, __version__)
 
 
 def close_connections():

@@ -9,7 +9,7 @@ import requests_kerberos
 
 from .credentials import IMPERSONATION
 from .errors import UnauthorizedError, TransportError, RedirectError, RelativeRedirect
-from .util import create_element, add_xml_child, get_redirect_url, xml_to_str, ns_translation
+from .util import create_element, add_xml_child, get_redirect_url, xml_to_str, ns_translation, HTTPOAuthAuth
 
 log = logging.getLogger(__name__)
 
@@ -19,12 +19,15 @@ NTLM = 'NTLM'
 BASIC = 'basic'
 DIGEST = 'digest'
 GSSAPI = 'gssapi'
+OAUTH = 'OAuth'
+
 
 AUTH_TYPE_MAP = {
     NTLM: requests_ntlm.HttpNtlmAuth,
     BASIC: requests.auth.HTTPBasicAuth,
     DIGEST: requests.auth.HTTPDigestAuth,
     GSSAPI: requests_kerberos.HTTPKerberosAuth,
+    OAUTH: HTTPOAuthAuth,
     NOAUTH: None,
 }
 
@@ -33,11 +36,11 @@ DEFAULT_HEADERS = {'Content-Type': 'text/xml; charset=%s' % DEFAULT_ENCODING, 'A
 
 
 def extra_headers(account):
+    """Generate extra HTTP headers
     """
-    Generate extra headers for impersonation requests. See
-    https://blogs.msdn.microsoft.com/webdav_101/2015/05/11/best-practices-ews-authentication-and-access-issues/
-    """
-    if account and account.access_type == IMPERSONATION:
+    if account:
+        # See
+        # https://blogs.msdn.microsoft.com/webdav_101/2015/05/11/best-practices-ews-authentication-and-access-issues/
         return {'X-AnchorMailbox': account.primary_smtp_address}
     return None
 
@@ -76,6 +79,10 @@ def get_auth_instance(credentials, auth_type):
     model = AUTH_TYPE_MAP[auth_type]
     if model is None:
         return None
+
+    if auth_type == OAUTH:
+        return model(token=credentials.token)
+
     username = credentials.username
     if auth_type == NTLM and credentials.type == credentials.EMAIL:
         username = '\\' + username

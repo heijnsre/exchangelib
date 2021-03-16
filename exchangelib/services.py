@@ -520,9 +520,37 @@ class EWSService(object):
                 field_path = FieldPath(field=field)
             additional_field_paths.append(field_path)
 
+        # In order to receive the Additional Properties FieldPath xml data from exchangelib
+        # in the same order consistently, we need to sort based on the FieldPath attributes.
+        # It's possible to have FieldPaths' field with the same `path` names, for example:
+        # <t:FieldURI FieldURI="contacts:Companies"/>
+        # <t:FieldURI FieldURI="task:Companies"/>
+        # where path name "Companies" is the same for both contacts and task, so the order of data
+        # returned could be flipped. So we need to sort based on the full FieldURI "contacts:Companies"
+        # instead of simply "Companies."
+        #
+        # Similarly,`field_uri` values could also be the same, for example:
+        # <t:IndexedFieldURI FieldIndex="EmailAddress1" FieldURI="contacts:EmailAddress"/>
+        # <t:IndexedFieldURI FieldIndex="EmailAddress3" FieldURI="contacts:EmailAddress"/>
+        # where FieldURI "contacts:EmailAddress" is the same.
+        #
+        # So, in order to have sorted() return consistently ordered results, we sort based on
+        # the path, field_uri, and the field index value which is derived specifically from
+        # value_cls.FIELDS[0].default.
+        def consistent_key(field_path):
+            known_attrs = ["field_uri", "value_cls.FIELDS[0].default"]
+            key = [field_path.path]
+
+            for attr in known_attrs:
+                val = getattr(field_path.field, attr, None)
+                if val is not None:
+                    key.append(val)
+
+            return key
+
         additional_properties = create_element('t:AdditionalProperties')
         expanded_fields = chain(*(f.expand(version=self.account.version) for f in additional_field_paths))
-        set_xml_value(additional_properties, sorted(expanded_fields, key=lambda f: f.path), self.account.version)
+        set_xml_value(additional_properties, sorted(expanded_fields, key=consistent_key), self.account.version)
         shape_element.append(additional_properties)
 
 
@@ -942,29 +970,13 @@ class UpdateItem(EWSAccountService, EWSPooledMixIn):
                 yield f.name
 
     def _get_item_update_elems(self, item, fieldnames):
-        from .items import CalendarItem
         fieldnames_set = set(fieldnames)
-
-        if item.__class__ == CalendarItem:
-            # For CalendarItem items where we update 'start' or 'end', we want to update internal timezone fields
-            item.clean_timezone_fields(version=self.account.version)  # Possibly also sets timezone values
-            meeting_tz_field, start_tz_field, end_tz_field = CalendarItem.timezone_fields()
-            if self.account.version.build < EXCHANGE_2010:
-                if 'start' in fieldnames_set or 'end' in fieldnames_set:
-                    fieldnames_set.add(meeting_tz_field.name)
-            else:
-                if 'start' in fieldnames_set:
-                    fieldnames_set.add(start_tz_field.name)
-                if 'end' in fieldnames_set:
-                    fieldnames_set.add(end_tz_field.name)
-        else:
-            meeting_tz_field, start_tz_field, end_tz_field = None, None, None
 
         for fieldname in self._sort_fieldnames(item_model=item.__class__, fieldnames=fieldnames_set):
             field = item.get_field_by_fieldname(fieldname)
             if field.is_read_only:
                 raise ValueError('%s is a read-only field' % field.name)
-            value = self._get_item_value(item, field, meeting_tz_field, start_tz_field, end_tz_field)
+            value = self._get_item_value(item, field)
             if value is None or (field.is_list and not value):
                 # A value of None or [] means we want to remove this field from the item
                 for elem in self._get_delete_item_elems(field=field):
@@ -973,19 +985,8 @@ class UpdateItem(EWSAccountService, EWSPooledMixIn):
                 for elem in self._get_set_item_elems(item_model=item.__class__, field=field, value=value):
                     yield elem
 
-    def _get_item_value(self, item, field, meeting_tz_field, start_tz_field, end_tz_field):
-        from .items import CalendarItem
+    def _get_item_value(self, item, field):
         value = field.clean(getattr(item, field.name), version=self.account.version)  # Make sure the value is OK
-        if item.__class__ == CalendarItem:
-            # For CalendarItem items where we update 'start' or 'end', we want to send values in the local timezone
-            if self.account.version.build < EXCHANGE_2010:
-                if field.name in ('start', 'end'):
-                    value = value.astimezone(getattr(item, meeting_tz_field.name))
-            else:
-                if field.name == 'start':
-                    value = value.astimezone(getattr(item, start_tz_field.name))
-                elif field.name == 'end':
-                    value = value.astimezone(getattr(item, end_tz_field.name))
         return value
 
     def _get_delete_item_elems(self, field):
@@ -1028,7 +1029,7 @@ class UpdateItem(EWSAccountService, EWSPooledMixIn):
         # Takes a list of (Item, fieldnames) tuples where 'Item' is a instance of a subclass of Item and 'fieldnames'
         # are the attribute names that were updated. Returns the XML for an UpdateItem call.
         # an UpdateItem request.
-        from .properties import ItemId
+        from .properties import ItemId, OccurrenceItemId
         if self.account.version.build >= EXCHANGE_2013_SP1:
             updateitem = create_element(
                 'm:%s' % self.SERVICE_NAME,
@@ -1050,7 +1051,10 @@ class UpdateItem(EWSAccountService, EWSPooledMixIn):
                 raise ValueError('"fieldnames" must not be empty')
             itemchange = create_element('t:ItemChange')
             log.debug('Updating item %s values %s', item.id, fieldnames)
-            set_xml_value(itemchange, ItemId(item.id, item.changekey), version=self.account.version)
+            if getattr(item, 'occurrence_item_id', None):
+                set_xml_value(itemchange, item.occurrence_item_id, version=self.account.version)
+            else:
+                set_xml_value(itemchange, ItemId(item.id, item.changekey), version=self.account.version)
             updates = create_element('t:Updates')
             for elem in self._get_item_update_elems(item=item, fieldnames=fieldnames):
                 updates.append(elem)
@@ -1085,7 +1089,7 @@ class DeleteItem(EWSAccountService, EWSPooledMixIn):
     def get_payload(self, items, delete_type, send_meeting_cancellations, affected_task_occurrences,
                     suppress_read_receipts):
         # Takes a list of (id, changekey) tuples or Item objects and returns the XML for a DeleteItem request.
-        from .properties import ItemId
+        from .properties import ItemId, OccurrenceItemId
         if self.account.version.build >= EXCHANGE_2013_SP1:
             deleteitem = create_element(
                 'm:%s' % self.SERVICE_NAME,
@@ -1105,7 +1109,10 @@ class DeleteItem(EWSAccountService, EWSPooledMixIn):
         item_ids = create_element('m:ItemIds')
         for item in items:
             log.debug('Deleting item %s', item)
-            set_xml_value(item_ids, to_item_id(item, ItemId), version=self.account.version)
+            if getattr(item, 'occurrence_item_id', None):
+                set_xml_value(item_ids, item.occurrence_item_id, version=self.account.version)
+            else:
+                set_xml_value(item_ids, to_item_id(item, ItemId), version=self.account.version)
         if not len(item_ids):
             raise ValueError('"items" must not be empty')
         deleteitem.append(item_ids)
@@ -2379,6 +2386,40 @@ class GetSearchableMailboxes(EWSService):
                 else:
                     for c in self._get_elements_in_container(container=container_or_exc):
                         yield c
+
+
+class MoveFolder(EWSAccountService):
+    """
+    https://docs.microsoft.com/en-us/exchange/client-developer/web-service-reference/movefolder-operation
+    """
+
+    SERVICE_NAME = "MoveFolder"
+    element_container_name = None
+
+    def call(self, folders, to_folder):
+        return list(self._get_elements(payload=self.get_payload(folders, to_folder)))
+
+    def get_payload(self, folders, to_folder):
+        from .folders import Folder, FolderId, DistinguishedFolderId
+
+        payload = create_element("m:{}".format(self.SERVICE_NAME))
+
+        to_folder_elem = create_element("m:ToFolderId")
+        if not isinstance(to_folder, (Folder, FolderId, DistinguishedFolderId)):
+            to_folder = to_item_id(to_folder, FolderId)
+        set_xml_value(to_folder_elem, to_folder, version=self.account.version)
+
+        folder_ids = create_element("m:FolderIds")
+        for folder in folders:
+            if not isinstance(folder, (Folder, FolderId, DistinguishedFolderId)):
+                folder = to_item_id(folder, FolderId)
+            set_xml_value(folder_ids, folder, version=self.account.version)
+        if not len(folder_ids):
+            raise ValueError('"folders" must not be empty')
+
+        payload.append(to_folder_elem)
+        payload.append(folder_ids)
+        return payload
 
 
 def to_item_id(item, item_cls):

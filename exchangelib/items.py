@@ -13,7 +13,8 @@ from .fields import BooleanField, IntegerField, DecimalField, Base64Field, TextF
     PhysicalAddressField, ExtendedPropertyField, AttachmentField, RecurrenceField, MailboxField, MailboxListField, \
     AttendeesField, Choice, OccurrenceField, OccurrenceListField, MemberListField, EWSElementField, \
     EffectiveRightsField, TimeZoneField, CultureField, IdField, CharField, TextListField, EnumAsIntField, \
-    EmailAddressField, FreeBusyStatusField, ReferenceItemIdField, AssociatedCalendarItemIdField
+    EmailAddressField, FreeBusyStatusField, ReferenceItemIdField, AssociatedCalendarItemIdField, OccurrenceItemIdField, \
+    GenericDateField
 from .properties import EWSElement, ItemId, ConversationId, ParentFolderId, Attendee, ReferenceItemId, \
     AssociatedCalendarItemId, PersonaId
 from .recurrence import FirstOccurrence, LastOccurrence, Occurrence, DeletedOccurrence
@@ -244,14 +245,18 @@ class Item(RegisterMixIn):
         return super(Item, cls).get_field_by_fieldname(fieldname)
 
     def save(self, update_fields=None, conflict_resolution=AUTO_RESOLVE, send_meeting_invitations=SEND_TO_NONE):
-        if self.id:
+        occurrence_item_id = getattr(self, 'occurrence_item_id', None)
+        if self.id or occurrence_item_id:
             item_id, changekey = self._update(
                 update_fieldnames=update_fields,
                 message_disposition=SAVE_ONLY,
                 conflict_resolution=conflict_resolution,
                 send_meeting_invitations=send_meeting_invitations
             )
-            if self.id != item_id:
+            if not occurrence_item_id and self.id != item_id:
+                # We can't match ids when using OccurrenceItemId, since that field
+                # doesn't include the item id of the individual occurrence. But
+                # otherwise, the item id should be the same.
                 raise ValueError("'id' mismatch in returned update response")
             # Don't check that changekeys are different. No-op saves will sometimes leave the changekey intact
             self.changekey = changekey
@@ -322,7 +327,8 @@ class Item(RegisterMixIn):
     def _update(self, update_fieldnames, message_disposition, conflict_resolution, send_meeting_invitations):
         if not self.account:
             raise ValueError('%s must have an account' % self.__class__.__name__)
-        if not self.changekey:
+        occurrence_item_id = getattr(self, 'occurrence_item_id', None)
+        if not self.changekey and not getattr(occurrence_item_id, 'changekey', None):
             raise ValueError('%s must have changekey' % self.__class__.__name__)
         if not update_fieldnames:
             # The fields to update was not specified explicitly. Update all fields where update is possible
@@ -414,8 +420,8 @@ class Item(RegisterMixIn):
     def _delete(self, delete_type, send_meeting_cancellations, affected_task_occurrences, suppress_read_receipts):
         if not self.account:
             raise ValueError('%s must have an account' % self.__class__.__name__)
-        if not self.id:
-            raise ValueError('%s must have an ID' % self.__class__.__name__)
+        if not self.id and not self.occurrence_item_id:
+            raise ValueError('%s must have an ID or occurrence item ID' % self.__class__.__name__)
         res = self.account.bulk_delete(
             ids=[self], delete_type=delete_type, send_meeting_cancellations=send_meeting_cancellations,
             affected_task_occurrences=affected_task_occurrences, suppress_read_receipts=suppress_read_receipts)
@@ -513,9 +519,10 @@ class CalendarItem(Item):
     """
     ELEMENT_NAME = 'CalendarItem'
     FIELDS = Item.FIELDS + [
+        OccurrenceItemIdField('occurrence_item_id', field_uri='calendar:OccurrenceItemId', is_syncback_only=True),
         TextField('uid', field_uri='calendar:UID', is_required_after_save=True, is_searchable=False),
-        DateTimeField('start', field_uri='calendar:Start', is_required=True),
-        DateTimeField('end', field_uri='calendar:End', is_required=True),
+        GenericDateField('start', field_uri='calendar:Start', is_required=True),
+        GenericDateField('end', field_uri='calendar:End', is_required=True),
         DateTimeField('original_start', field_uri='calendar:OriginalStart', is_read_only=True),
         BooleanField('is_all_day', field_uri='calendar:IsAllDayEvent', is_required=True, default=False),
         FreeBusyStatusField('legacy_free_busy_status', field_uri='calendar:LegacyFreeBusyStatus', is_required=True,
@@ -573,12 +580,16 @@ class CalendarItem(Item):
         URIField('net_show_url', field_uri='calendar:NetShowUrl'),
     ]
 
+
     @classmethod
     def timezone_fields(cls):
         return [f for f in cls.FIELDS if isinstance(f, TimeZoneField)]
 
     def clean_timezone_fields(self, version):
         # pylint: disable=access-member-before-definition
+        if self.is_all_day is True:
+            # No timezones for all day events!
+            return
         # Sets proper values on the timezone fields if they are not already set
         if version.build < EXCHANGE_2010:
             if self._meeting_timezone is None and self.start is not None:

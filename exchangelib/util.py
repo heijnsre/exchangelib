@@ -8,6 +8,7 @@ import logging
 import re
 import socket
 import time
+from six.moves.urllib.request import parse_keqv_list, parse_http_list
 
 # Import _etree via defusedxml instead of directly from lxml.etree, to silence overly strict linters
 from defusedxml.lxml import parse, fromstring, tostring, GlobalParserTLS, RestrictedElement, _etree
@@ -18,11 +19,13 @@ import isodate
 from pygments import highlight
 from pygments.lexers.html import XmlLexer
 from pygments.formatters.terminal import TerminalFormatter
+import requests.auth
 import requests.exceptions
+from requests import Request
 from six import text_type, string_types
 
 from .errors import TransportError, RateLimitError, RedirectError, RelativeRedirect, CASError, UnauthorizedError, \
-    ErrorInvalidSchemaVersionForMailboxVersion
+    InvalidTokenError, ErrorInvalidSchemaVersionForMailboxVersion
 
 time_func = time.time if PY2 else time.monotonic
 log = logging.getLogger(__name__)
@@ -509,6 +512,15 @@ Response data: %(xml_response)s
             # Always create a dummy response for logging purposes, in case we fail in the following
             r = DummyResponse(url=url, headers={}, request_headers=headers)
             try:
+                data = data.encode('utf-8')
+            except UnicodeDecodeError:
+                try:
+                    data = data.decode('utf-8').encode('utf-8')
+                except UnicodeDecodeError:
+                    import chardet
+                    encoding_info = chardet.detect(data)
+                    data = data.decode('utf-8').encode(encoding_info['encoding'])
+            try:
                 r = session.post(url=url,
                                  headers=headers,
                                  data=data,
@@ -612,22 +624,70 @@ def _redirect_or_fail(response, redirects, allow_redirects):
     return redirect_url, redirects
 
 
+def extract_oauth_error(www_authenticate_header):
+    # Exchange fact #234265 - when using Office365 with an expired access token,
+    # Exchange will simply raise a 401 error and return an HTML error page. However,
+    # if you dig into the `WWW-Authenticate` header, you'll see something like this:
+    # `'Bearer client_id="*", trusted_issuers="*", token_types="app_asserted_user_v1 service_asserted_app_v1",
+    # authorization_uri="https://login.windows.net/common/oauth2/authorize", error="invalid_token"`
+    # This function extracts this error field.
+    if www_authenticate_header.startswith('Bearer') is False:
+        return None
+
+    _, _, value = www_authenticate_header.partition('Bearer')
+    items = parse_http_list(value)
+
+    # Sometime Exchange returns elements which aren't key-values,
+    # e.g: `Bearer Realm="",Negotiate,Basic Realm=""`
+    filtered_items = [item for item in items if '=' in item]
+    filtered_options = parse_keqv_list(filtered_items)
+
+    if 'error' in filtered_options:
+        return filtered_options['error']
+
+    return None
+
+
 def _raise_response_errors(response, protocol, log_msg, log_vals):
     cas_error = response.headers.get('X-CasErrorCode')
+    www_authenticate = response.headers.get('WWW-Authenticate')
+
     if cas_error:
         if cas_error.startswith('CAS error:'):
             # Remove unnecessary text
             cas_error = cas_error.split(':', 1)[1].strip()
         raise CASError(cas_error=cas_error, response=response)
+
     if response.status_code == 500 and ('The specified server version is invalid' in response.text or
                                         'ErrorInvalidSchemaVersionForMailboxVersion' in response.text):
         raise ErrorInvalidSchemaVersionForMailboxVersion('Invalid server version')
+
     if 'The referenced account is currently locked out' in response.text:
         raise TransportError('The service account is currently locked out')
-    if response.status_code == 401 and protocol.credentials.fail_fast:
-        # This is a login failure
-        raise UnauthorizedError('Wrong username or password for %s' % response.url)
+
+    if response.status_code == 401:
+        if www_authenticate is not None:
+            error = extract_oauth_error(www_authenticate)
+            if error == 'invalid_token':
+                raise InvalidTokenError('Invalid Office365 OAuth token')
+
+        if protocol.credentials.fail_fast:
+            # This is a login failure
+            raise UnauthorizedError('Wrong username or password for %s' % response.url)
+
     if 'TimeoutException' in response.headers:
         raise response.headers['TimeoutException']
+
     # This could be anything. Let higher layers handle this. Add full context for better debugging.
     raise TransportError(str('Unknown failure\n') + log_msg % log_vals)
+
+
+class HTTPOAuthAuth(requests.auth.AuthBase):  # type: ignore
+    """Helper class for setting the Authorization header on HTTP requests."""
+
+    def __init__(self, token):
+        self.token = token
+
+    def __call__(self, r):
+        r.headers[b'Authorization'] = b'Bearer {}'.format(self.token.encode('utf-8'))
+        return r

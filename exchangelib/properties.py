@@ -171,8 +171,9 @@ class EWSElement(object):
 
     @classmethod
     def supported_fields(cls, version=None):
-        # Return non-ID field names. If version is specified, only return the fields supported by this version
-        return tuple(f for f in cls.FIELDS if not f.is_attribute and f.supports_version(version))
+        # Return non-ID field names if they're not used only for syncback.
+        # If version is specified, only return the fields supported by this version
+        return tuple(f for f in cls.FIELDS if not f.is_attribute and not f.is_syncback_only and f.supports_version(version))
 
     @classmethod
     def get_field_by_fieldname(cls, fieldname):
@@ -321,6 +322,28 @@ class PersonaId(ItemId):
         return '{%s}%s' % (TNS, cls.ELEMENT_NAME)
 
     __slots__ = ItemId.__slots__
+
+
+class OccurrenceItemId(ItemId):
+    # https://docs.microsoft.com/en-us/exchange/client-developer/web-service-reference/occurrenceitemid
+    ELEMENT_NAME = 'OccurrenceItemId'
+
+    MASTER_ID_ATTR = 'RecurringMasterId'
+    CHANGEKEY_ATTR = 'ChangeKey'
+    INSTANCE_INDEX_ATTR = 'InstanceIndex'
+    FIELDS = [
+        IdField('master_id', field_uri=MASTER_ID_ATTR, is_required=True),
+        IdField('changekey', field_uri=CHANGEKEY_ATTR, is_required=False),
+        IdField('instance_index', field_uri=INSTANCE_INDEX_ATTR, is_required=True),
+    ]
+
+    __slots__ = ('master_id', 'changekey', 'instance_index')
+
+    def __init__(self, *args, **kwargs):
+        if not kwargs:
+            # Allow to set attributes without keyword
+            kwargs = dict(zip(self.__slots__, args))
+        super(OccurrenceItemId, self).__init__(**kwargs)
 
 
 class Mailbox(EWSElement):
@@ -548,7 +571,12 @@ class TimeZone(EWSElement):
         for transition in transitiongroup:
             period = periods[transition['to']]
             if len(transition.keys()) == 1:
-                # This is a simple transition to STD time. That cannot be represented by this class
+                # This is a simple transition representing a timezone with no DST. Some servers don't accept TimeZone
+                # elements without a STD and DST element (see issue #488). Return StandardTime and DaylightTime objects
+                # with dummy values and 0 bias - this satisfies the broken servers and hopefully doesn't break the
+                # well-behaving servers.
+                standard_time = StandardTime(bias=0, time=datetime.time(0), occurrence=1, iso_month=1, weekday=1)
+                daylight_time = DaylightTime(bias=0, time=datetime.time(0), occurrence=5, iso_month=12, weekday=7)
                 continue
             # 'offset' is the time of day to transition, as timedelta since midnight. Must be a reasonable value
             if not datetime.timedelta(0) <= transition['offset'] < datetime.timedelta(days=1):
